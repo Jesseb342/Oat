@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: xcode-27
     timeout-minutes: 360
 
     steps:
@@ -26,6 +26,25 @@ jobs:
       # ================================================
       # ENVIRONMENT
       # ================================================
+
+      - name: Select tested Xcode 27.2 Metal toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          XCODE="/Applications/Xcode_27.2.app"
+          if [[ ! -d "$XCODE" ]]; then
+            echo "::error::Xcode 27.2 is not installed on this runner. Available Xcode installations:"
+            find /Applications -maxdepth 1 -name 'Xcode*.app' -print | sort
+            exit 1
+          fi
+
+          sudo xcode-select --switch "$XCODE/Contents/Developer"
+          echo "Selected toolchain:"
+          xcodebuild -version
+          xcodebuild -downloadComponent MetalToolchain
+          echo "Metal compiler:"
+          xcrun metal -v 2>&1 | head -n 8 || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
