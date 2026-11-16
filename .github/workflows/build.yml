@@ -1,0 +1,55 @@
+name: Test Part 1 Download Only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-download:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Download and verify Game_URL_1
+        env:
+          PART1_URL: ${{ secrets.Game_URL_1 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK="$RUNNER_TEMP/test-dl"
+          mkdir -p "$WORK"
+          TARGET="$WORK/game.part1.rar"
+
+          if [[ -z "${PART1_URL:-}" ]]; then
+            echo "::error::Game_URL_1 secret is empty."
+            exit 1
+          fi
+
+          echo "Starting download of Game_URL_1..."
+          curl --fail --location --show-error --progress-bar \
+            --retry 3 --retry-delay 5 --connect-timeout 30 \
+            --output "$TARGET" "$PART1_URL"
+
+          echo ""
+          echo "=== Download Verification ==="
+          ls -lh "$TARGET"
+          FILE_TYPE=$(file -b "$TARGET")
+          echo "Detected file type: $FILE_TYPE"
+
+          # Catch hosters that return an HTML landing/rate-limit page with a 200 OK status
+          if [[ "$FILE_TYPE" != *"RAR archive"* ]]; then
+            echo "::error::Downloaded file is NOT a valid RAR archive (got: $FILE_TYPE). Check your link."
+            head -c 500 "$TARGET" || true
+            exit 1
+          fi
+
+          echo "SUCCESS: Valid RAR archive downloaded!"
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/test-dl"
