@@ -113,13 +113,15 @@ jobs:
           GAME_DIR="$RUNNER_TEMP/GameFiles"
           mkdir -p "$GAME_DIR"
 
+          # Extract directly into the builder's input directory. Do not create
+          # a second 25+ GB copy of the NUP after unar has written it.
           python - "$WORK" "$GAME_DIR" <<'PY'
-          import shutil, subprocess, sys, os
+          import subprocess, sys, os
           from pathlib import Path
 
           work = Path(sys.argv[1])
           game_dir = Path(sys.argv[2])
-          extract_dir = work / "extracted-game"
+          extract_dir = game_dir
           extract_dir.mkdir(parents=True, exist_ok=True)
 
           first_part = work / "game.part1.rar"
@@ -137,9 +139,7 @@ jobs:
               raise SystemExit("No .nup or game packages found inside the extracted RAR files.")
 
           for pkg in packages:
-              target = game_dir / pkg.name
-              shutil.copy2(pkg, target)
-              print(f"Prepared package: {target.name} ({target.stat().st_size:,} bytes)")
+              print(f"Using package in place: {pkg} ({pkg.stat().st_size:,} bytes)")
 
           # Free up runner disk space immediately after extraction
           for part in work.glob("game.part*.rar"):
@@ -219,7 +219,12 @@ jobs:
           GAME_DIR="$RUNNER_TEMP/GameFiles"
           OUTPUT="$RUNNER_TEMP/NxNative-OoT.ipa"
 
-          NUP_FILE=$(find "$GAME_DIR" -maxdepth 1 -name "*.nup" | head -n 1)
+          NUP_FILE=$(find "$GAME_DIR" -maxdepth 1 -name "*.nup" -print -quit)
+          if [[ -z "$NUP_FILE" ]]; then
+            echo "::error::No NUP package was found in $GAME_DIR."
+            exit 1
+          fi
+          echo "Building directly from: $NUP_FILE"
           python scripts/build_ipa_from_nsp.py \
             "$NUP_FILE" \
             -o "$OUTPUT"
