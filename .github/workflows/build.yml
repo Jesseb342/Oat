@@ -1,4 +1,4 @@
-name: Test Part 1 Download Only
+name: NxNative - OoT iPhone 14 Builder
 
 on:
   workflow_dispatch:
@@ -7,49 +7,230 @@ permissions:
   contents: read
 
 jobs:
-  test-download:
+  build:
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 360
 
     steps:
-      - name: Download and verify Game_URL_1
+
+      # ================================================
+      # CHECKOUT
+      # ================================================
+
+      - name: Checkout A15/Low-RAM Optimized version for OoT
+        uses: actions/checkout@v4
+        with:
+          repository: widmonstertony/nxnative
+          ref: main
+
+      # ================================================
+      # ENVIRONMENT
+      # ================================================
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd spirv-cross unar
+          python -m pip install --upgrade pip
+          python -m pip install lz4 capstone fonttools backports.zstd
+
+      # ================================================
+      # DOWNLOAD ALL MULTI-PART RAR FILES
+      # ================================================
+
+      - name: Download split RAR archive parts
         env:
           PART1_URL: ${{ secrets.Game_URL_1 }}
+          PART2_URL: ${{ secrets.Game_URL_2 }}
+          PART3_URL: ${{ secrets.Game_URL_3 }}
         shell: bash
         run: |
           set -euo pipefail
 
-          WORK="$RUNNER_TEMP/test-dl"
+          WORK="$RUNNER_TEMP/nxnative"
           mkdir -p "$WORK"
-          TARGET="$WORK/game.part1.rar"
 
-          if [[ -z "${PART1_URL:-}" ]]; then
-            echo "::error::Game_URL_1 secret is empty."
+          download_part() {
+            local url="$1"
+            local output="$2"
+            if [[ -z "${url:-}" ]]; then
+              echo "::error::Required split archive URL is empty."
+              exit 1
+            fi
+            echo "Downloading $output..."
+            curl --fail --location --show-error --progress-bar \
+              --retry 3 --retry-delay 5 --connect-timeout 30 \
+              --output "$output" "$url"
+          }
+
+          download_part "$PART1_URL" "$WORK/game.part1.rar"
+          download_part "$PART2_URL" "$WORK/game.part2.rar"
+          download_part "$PART3_URL" "$WORK/game.part3.rar"
+
+          echo "All multi-part archives downloaded successfully."
+
+      # ================================================
+      # EXTRACT MULTI-PART RAR & CLEANUP PARTS
+      # ================================================
+
+      - name: Extract multi-part RAR to locate .nup
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK="$RUNNER_TEMP/nxnative"
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+          mkdir -p "$GAME_DIR"
+
+          python - "$WORK" "$GAME_DIR" <<'PY'
+          import shutil, subprocess, sys, os
+          from pathlib import Path
+
+          work = Path(sys.argv[1])
+          game_dir = Path(sys.argv[2])
+          extract_dir = work / "extracted-game"
+          extract_dir.mkdir(parents=True, exist_ok=True)
+
+          first_part = work / "game.part1.rar"
+          if not first_part.exists():
+              raise SystemExit("game.part1.rar is missing.")
+
+          print("Extracting multi-part RAR archive via unar...")
+          subprocess.run(
+              ["unar", "-o", str(extract_dir), str(first_part)],
+              check=True
+          )
+
+          packages = [p for p in extract_dir.rglob("*") if p.is_file() and p.suffix.lower() in (".nup", ".nsp", ".xci")]
+          if not packages:
+              raise SystemExit("No .nup or game packages found inside the extracted RAR files.")
+
+          for pkg in packages:
+              target = game_dir / pkg.name
+              shutil.copy2(pkg, target)
+              print(f"Prepared package: {target.name} ({target.stat().st_size:,} bytes)")
+
+          # Free up runner disk space immediately after extraction
+          for part in work.glob("game.part*.rar"):
+              part.unlink()
+              print(f"Removed temporary archive part: {part.name}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("is_nup=true\n")
+          PY
+
+      # ================================================
+      # INJECT A15 / 30FPS / METALFX PERFORMANCE PROFILE
+      # ================================================
+
+      - name: Inject A15 Low-RAM Performance Overrides
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENV_DIR="dm/config"
+          mkdir -p "$ENV_DIR"
+
+          cat << 'EOF' > "$ENV_DIR/default_overrides.env"
+          DM_FPS_TARGET=30
+          DM_USE_METAL_FX_INTERPOLATION=1
+          DM_RENDER_SCALE=65
+          DM_DISABLE_HEAVY_POST_PROCESSING=1
+          DM_REAL_TIME_PRESENTING=1
+          DM_DEADLINE_BOOST=1
+          DM_LOW_RAM_MODE=1
+          EOF
+
+          if [[ -d "dm/games/0400486024DEC000" ]]; then
+            cp "$ENV_DIR/default_overrides.env" "dm/games/0400486024DEC000/env"
+          fi
+
+      # ================================================
+      # ADAPT SHADER TOOL LOCK
+      # ================================================
+
+      - name: Adapt shader translation lock to runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("scripts/build_ipa_from_nsp.py")
+          if path.exists():
+              source = path.read_text()
+              old = """    PROG.stage('iOS shaders')
+                  if provisional:
+                      PROG.set(step='chain header')
+                      run([py, repo / 'dm/gfx/tools/dmsh_chain.py', '--header'], logs / 'dmsh_chain.log', env=env)
+                  chain = re.search(r'#define DMSH_CHAIN "(.*)"', g.table('dmsh_chain.h').read_text()).group(1)
+              """
+              new = """    PROG.stage('iOS shaders')
+                  PROG.set(step='toolchain lock')
+                  run([py, repo / 'dm/gfx/tools/dmsh_chain.py', '--update-lock'], logs / 'dmsh_chain_lock.log', env=env)
+                  PROG.set(step='chain header')
+                  run([py, repo / 'dm/gfx/tools/dmsh_chain.py', '--header'], logs / 'dmsh_chain.log', env=env)
+                  chain = re.search(r'#define DMSH_CHAIN "(.*)"', g.table('dmsh_chain.h').read_text()).group(1)
+              """
+              if old in source:
+                  path.write_text(source.replace(old, new, 1))
+          PY
+
+      # ================================================
+      # BUILD UNSIGNED IPA
+      # ================================================
+
+      - name: Build unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK="$RUNNER_TEMP/nxnative"
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+          OUTPUT="$RUNNER_TEMP/NxNative-OoT.ipa"
+
+          NUP_FILE=$(find "$GAME_DIR" -maxdepth 1 -name "*.nup" | head -n 1)
+          python scripts/build_ipa_from_nsp.py \
+            "$NUP_FILE" \
+            -o "$OUTPUT"
+
+          if [[ ! -s "$OUTPUT" ]]; then
+            echo "::error::IPA build did not produce an output file."
             exit 1
           fi
 
-          echo "Starting download of Game_URL_1..."
-          curl --fail --location --show-error --progress-bar \
-            --retry 3 --retry-delay 5 --connect-timeout 30 \
-            --output "$TARGET" "$PART1_URL"
+          ls -lh "$OUTPUT"
 
-          echo ""
-          echo "=== Download Verification ==="
-          ls -lh "$TARGET"
-          FILE_TYPE=$(file -b "$TARGET")
-          echo "Detected file type: $FILE_TYPE"
+      # ================================================
+      # UPLOAD IPA
+      # ================================================
 
-          # Catch hosters that return an HTML landing/rate-limit page with a 200 OK status
-          if [[ "$FILE_TYPE" != *"RAR archive"* ]]; then
-            echo "::error::Downloaded file is NOT a valid RAR archive (got: $FILE_TYPE). Check your link."
-            head -c 500 "$TARGET" || true
-            exit 1
-          fi
+      - name: Upload IPA
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NxNative-OoT-iPhone14-IPA
+          path: ${{ runner.temp }}/NxNative-OoT.ipa
+          if-no-files-found: error
+          retention-days: 7
 
-          echo "SUCCESS: Valid RAR archive downloaded!"
+      # ================================================
+      # CLEANUP
+      # ================================================
 
-      - name: Cleanup
+      - name: Clean up downloaded files
         if: always()
         shell: bash
         run: |
-          rm -rf "$RUNNER_TEMP/test-dl"
+          rm -rf "$RUNNER_TEMP/nxnative" "$RUNNER_TEMP/GameFiles"
