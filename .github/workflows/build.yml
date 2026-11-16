@@ -43,7 +43,7 @@ jobs:
           set -euo pipefail
           brew install xcodegen zstd spirv-cross unar
           python -m pip install --upgrade pip
-          python -m pip install lz4 capstone fonttools backports.zstd
+          python -m pip install lz4 capstone fonttools zbic backports.zstd
 
       # ================================================
       # DOWNLOAD ALL MULTI-PART RAR FILES
