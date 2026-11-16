@@ -83,14 +83,46 @@ jobs:
           download_part() {
             local url="$1"
             local output="$2"
+            local attempt=1
+            local max_attempts=10
+            local status=0
+
             if [[ -z "${url:-}" ]]; then
               echo "::error::Required split archive URL is empty."
               exit 1
             fi
-            echo "Downloading $output..."
-            curl --fail --location --show-error --progress-bar \
-              --retry 3 --retry-delay 5 --connect-timeout 30 \
-              --output "$output" "$url"
+
+            echo "Downloading $output with resumable retries..."
+            while (( attempt <= max_attempts )); do
+              echo "Download attempt $attempt/$max_attempts"
+              status=0
+              # Re-run curl for each attempt so -C - picks up the current
+              # partial-file size after a connection reset.
+              curl --fail --location --show-error --progress-bar \
+                --connect-timeout 30 --continue-at - \
+                --output "$output" "$url" || status=$?
+
+              if (( status == 0 )); then
+                echo "Completed $output"
+                return 0
+              fi
+
+              # Exit 33 means the server rejected the requested byte range.
+              # Do not silently append or corrupt data; fail with a clear hint.
+              if (( status == 33 )); then
+                echo "::error::Server does not support resuming $output (curl exit 33)."
+                return "$status"
+              fi
+
+              if (( attempt == max_attempts )); then
+                echo "::error::Download failed after $max_attempts attempts (curl exit $status)."
+                return "$status"
+              fi
+
+              echo "Download interrupted (curl exit $status); preserving partial file and retrying in 10 seconds..."
+              sleep 10
+              ((attempt += 1))
+            done
           }
 
           download_part "$PART1_URL" "$WORK/game.part1.rar"
